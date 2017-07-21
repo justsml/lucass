@@ -1,82 +1,82 @@
 const fs = require('fs')
 const path = require('path')
-const once = require('once')
-const createHasher = require('hashes-stream')
+const hasha = require('hasha')
+const isStream = require('is-stream')
+const intoStream = require('into-stream')
+const {promised, tempFilePath} = require('./lib/utils')
 
-const isDirectory = dir => fs.statSync(dir).isDirectory()
+module.exports = FileStore
 
-class FileSystemContentAddressableStorage {
-  constructor (dir, algo = 'sha256', _createHasher = createHasher) {
-    /* This statement is tested but because it gets wrapped in a try/catch
-       the coverage report doesn't notice. */
-    /* istanbul ignore if */
-    if (!isDirectory(dir)) throw new Error('Not a directory.')
-    this.dir = dir
-    this._algo = algo
-    this._createHasher = _createHasher
-  }
-  set (value, cb) {
-    if (Buffer.isBuffer(value)) {
-      return this._setBuffer(value, cb)
-    }
-    if (value && typeof value === 'object' && value.readable) {
-      return this._setStream(value, cb)
-    }
-    process.nextTick(() => cb(new Error('value is a not a valid type')))
-  }
-  hash (value, cb) {
-    let hasher = this._createHasher(this._algo, cb)
-    if (Buffer.isBuffer(value)) {
-      hasher.write(value)
-      hasher.end()
-      return
-    }
-    if (value && typeof value === 'object' && value.readable) {
-      return value.pipe(hasher)
-    }
-    process.nextTick(() => cb(new Error('value is a not a valid type')))
-  }
-  _setBuffer (value, cb) {
-    this.hash(value, (err, hash) => {
-      if (err) return cb(err)
-      fs.writeFile(path.join(this.dir, hash), value, err => {
-        if (err) return cb(err)
-        cb(null, hash)
-      })
-    })
-  }
-  _setStream (value, cb) {
-    cb = once(cb)
-    let hash
-    let closed
-    let tmpfile = path.join(this.dir, '.' + Date.now() + Math.random())
-    let finish = () => {
-      fs.rename(tmpfile, path.join(this.dir, hash), err => {
-        if (err) return cb(err)
-        cb(null, hash)
-      })
-    }
-    let hasher = this._createHasher(this._algo, (err, _hash) => {
-      if (err) return cb(err)
-      hash = _hash
-      if (closed) finish()
-    })
-    let file = fs.createWriteStream(tmpfile)
-    file.on('error', cb)
-    file.on('close', () => {
-      closed = true
-      if (hash) finish()
-    })
-    value.pipe(file)
-    value.pipe(hasher)
+// FileStore is merely a closure, defining a scope for the shared vars `dir` and `algo`
+function FileStore(dir, algo = 'sha256') {
+  // n.b. Functional JS doesn't benefit from Java-inspired word vomit :)
+
+  if (!fs.statSync(dir).isDirectory()) throw new Error('Not a directory.')
+
+  // Simply return any "Public" methods - defined below
+  // No need for inheritance, `class`/prototype, or shared mutable state! #FTW
+  return {hash, set, getBuffer, getStream}
+
+  // Updated to use (simple) Functional Programming concepts - *and patch in callback support*
+  function set(value, cb) {
+    return __validate(value)            // First check input data
+    .then(__saveStream)                 // save stream & return temp path
+    .then(filePath => Promise.props({   // BB.Props will resolve __hashStream
+        hash: __hashStream(filePath),   // ... here, Hash input,
+        filePath,                       // ... next, pass on the `filePath` unchanged
+      }))
+    .tap(r => console.warn('HASH:', r)) // Optional/Debugging method :)
+    .then(__renameWithHash)             // Now, with hash in hand, name file with signature
+    .then(hash => cb(null, hash))       // Promise-to-Callback wireup
+    .catch(cb)                          // Wire Promise errors to the callback handler
   }
 
-  getBuffer (hash, cb) {
-    fs.readFile(path.join(this.dir, hash), cb)
+  // Lazily using sindre's hasha for this bit
+  function hash(value, cb) {
+    return __validate(value)            // Re-use input validation (ensure no ad hoc logic gets slipped in)
+      .then(isStream(value) ? hasha.fromStream(value, {algorithm: algo}) : hasha(value, {algorithm: algo}))
+      .then(hash => cb(null, hash)).catch(cb) // Promise-to-Callback wireup, w/ err handler
   }
-  getStream (hash, cb) {
-    return fs.createReadStream(path.join(this.dir, hash))
+
+  // Original Method
+  function getBuffer(hash, cb) {
+    fs.readFile(path.join(dir, hash), cb)
   }
+
+  function getStream(hash) {
+    return fs.createReadStream(path.join(dir, hash)).read(0)
+  }
+
+  // A central input/state checker, use w/ any input-handling functions
+  function __validate(value) {
+    if (algo === 'noop') return Promise.reject(new Error('invalid algorithim'))
+    return Buffer.isBuffer(value) || (isStream(value) && value.readable) ? Promise.resolve(value) : Promise.reject(new Error('value is a not a valid type'))
+  }
+
+  // Saves a readable stream to a temp path and returns the file path
+  function __saveStream(stream) {
+    // This pattern is well-suited for certain stream and/or event use cases
+    // e.g. Avoiding extra closure from `new Promise((resolve, reject)) => {})`
+    let [promise, resolve,  reject] = promised()
+    let filePath = tempFilePath(dir)
+    stream = isStream(stream) ? stream : intoStream(stream)
+    stream.pipe(fs.createWriteStream(filePath))
+      .on('end', () => resolve(filePath))
+      .on('error', reject)
+    return promise
+  }
+
+  // Accepts a stream (or filePath) and returns a Promise of its Hash
+  function __hashStream(stream) {
+    stream = typeof stream === 'string' ? fs.createReadStream(stream) : stream
+    return hasha.fromStream(stream, {algorithm: algo})
+  }
+
+  // Final step, returns the hash when done.
+  // After the `.then()`, the file is stored and can be retrieved using its hash.
+  function __renameWithHash({filePath, hash}) {
+    return fs.renameAsync(filePath, path.join(dir, hash))
+      .then(() => ({ hash }))
+  }
+
 }
-
-module.exports = (dir, algo, ch) => new FileSystemContentAddressableStorage(dir, algo, ch)

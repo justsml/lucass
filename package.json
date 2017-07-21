@@ -21,7 +21,12 @@
   "license": "Apache-2.0",
   "dependencies": {
     "bl": "^1.2.1",
+    "bluebird": "^3.5.0",
+    "get-stream": "^3.0.0",
+    "hasha": "^3.0.0",
     "hashes-stream": "^1.1.0",
+    "into-stream": "^3.1.0",
+    "is-stream": "^1.1.0",
     "tap": "^10.7.0",
     "through2": "^2.0.3"
   },
